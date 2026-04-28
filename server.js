@@ -1,290 +1,216 @@
-import "dotenv/config";
-import express from "express";
-import multer from "multer";
-import cors from "cors";
-import OpenAI from "openai";
-import crypto from "crypto";
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const { OpenAI } = require('openai');
+require('dotenv').config();
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: '50mb' }));
 
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  dest: 'uploads/',
+  limits: { fileSize: 20 * 1024 * 1024 }
 });
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-function toDataUrl(buffer, mimeType) {
-  return `data:${mimeType};base64,${buffer.toString("base64")}`;
-}
+const sessions = {};
 
-function newId(prefix = "") {
-  return prefix + crypto.randomBytes(8).toString("hex");
-}
-
-/**
- * sessions = Map<sessionId, { images: [{imageId, createdAt, caption, mimeType, dataUrl}], chat: [] }>
- */
-const sessions = new Map();
-
-function getSession(sessionId = "default") {
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, { images: [], chat: [] });
+function getSession(sessionId) {
+  if (!sessions[sessionId]) {
+    sessions[sessionId] = { images: [], history: [] };
   }
-  return sessions.get(sessionId);
+  return sessions[sessionId];
 }
 
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-/**
- * POST /images
- * Form-data:
- *  - image: file
- *  - sessionId: string (optional)
- */
-app.post("/images", upload.single("image"), async (req, res) => {
+// POST /images — Upload image, get AI description in chosen language
+app.post('/images', upload.single('image'), async (req, res) => {
   try {
-    const sessionId = req.body?.sessionId || "default";
+    const { sessionId = 'default', language = 'en', languageName = 'English' } = req.body;
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: 'No image uploaded' });
+
+    const imageData = fs.readFileSync(file.path);
+    const base64Image = imageData.toString('base64');
+    const mimeType = file.mimetype || 'image/jpeg';
+    const imageId = `img_${Date.now()}`;
+
     const session = getSession(sessionId);
+    session.images.push({ id: imageId, base64: base64Image, mimeType, timestamp: Date.now() });
+    if (session.images.length > 10) session.images = session.images.slice(-10);
 
-    if (!req.file) return res.status(400).json({ error: "No image uploaded" });
+    let systemPrompt;
+    if (language === 'en') {
+      systemPrompt = `You are a visual assistant helping a visually impaired person explore the world.
 
-    const mimeType = req.file.mimetype || "image/jpeg";
-    const dataUrl = toDataUrl(req.file.buffer, mimeType);
+FIRST: If you recognize ANYTHING specific — a landmark, building, artwork, statue, monument, brand, product, logo, animal species, plant, food dish, restaurant, store, book, sign, currency, vehicle model, medication, clothing brand, sports team, celebrity, or any identifiable object — name it and give a brief useful fact. Examples:
+- "This is Burrus Hall at Virginia Tech, built in 1936, the main administrative building."
+- "This is a Starbucks coffee shop, the entrance is on your right."
+- "This looks like a Golden Retriever, a very friendly breed."
+- "This is a 20 Euro bill."
+- "This appears to be Tylenol, 500mg acetaminophen tablets."
+- "This is the Mona Lisa by Leonardo da Vinci, painted around 1503."
+- "This is a Toyota Camry, looks like a 2022 model."
+- "This is a can of Coca-Cola."
 
-    const r = await client.responses.create({
-      model: "gpt-5",
-      input: [
+THEN describe:
+- What the scene looks like (colors, layout, size, surroundings)
+- Any text visible (read it out fully)
+- Potential hazards or obstacles (stairs, curbs, crowds, traffic, wet floors)
+- Helpful context (doors, pathways, prices, directions, distances)
+
+Keep it concise but informative (3-5 sentences). Be warm like a knowledgeable friend walking beside them.`;
+    } else {
+      systemPrompt = `You are a visual assistant helping a visually impaired person explore the world.
+
+FIRST: If you recognize ANYTHING specific — a landmark, building, artwork, statue, monument, brand, product, logo, animal species, plant, food dish, restaurant, store, book, sign, currency, vehicle model, medication, clothing brand, sports team, celebrity, or any identifiable object — name it and give a brief useful fact in ${languageName}.
+
+THEN describe:
+- What the scene looks like (colors, layout, size, surroundings)
+- Any text visible (read it out and translate it to ${languageName} if it's in another language)
+- Potential hazards or obstacles (stairs, curbs, crowds, traffic, wet floors)
+- Helpful context (doors, pathways, prices, directions, distances)
+
+IMPORTANT: Respond ENTIRELY in ${languageName} (${language}). Keep it concise (3-5 sentences). Be warm like a knowledgeable friend walking beside them.`;
+    }
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
         {
-          role: "user",
+          role: 'user',
           content: [
-            {
-              type: "input_text",
-              text:
-                "You are a visual assistant for a visually impaired person.\n\n" +
-                "Describe what you see in a natural, conversational way like a friendly guide. " +
-                "Do NOT use headings or lists. Mention text only if it is clearly readable. " +
-                "Mention safety hazards only if clearly visible.\n\n" +
-                "If it looks like art/exhibit, give likely context, but if unsure say 'it appears to be' or 'likely'.",
-            },
-            { type: "input_image", image_url: dataUrl },
-          ],
-        },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}`, detail: 'low' } },
+            { type: 'text', text: language === 'en' ? 'What do you see? Identify and describe everything.' : `What do you see? Identify and describe everything. Respond in ${languageName}.` }
+          ]
+        }
       ],
+      max_tokens: 600
     });
 
-    const caption = (r.output_text || "").trim();
-    if (!caption) return res.status(500).json({ error: "Empty response from model" });
+    const caption = response.choices[0]?.message?.content || 'Could not describe the image.';
+    session.history.push({ role: 'assistant', content: caption, imageId });
+    fs.unlink(file.path, () => {});
 
-    const imageId = newId("img_");
-    session.images.push({
-      imageId,
-      createdAt: Date.now(),
-      caption,
-      mimeType,
-      dataUrl,
-    });
-
-    res.json({
-      sessionId,
-      imageId,
-      caption,
-      imageCount: session.images.length,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Failed to store/describe image" });
+    res.json({ imageId, caption });
+  } catch (err) {
+    console.error('Error processing image:', err.message);
+    if (req.file) fs.unlink(req.file.path, () => {});
+    res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * Helper: parse user phrases so they don’t need IDs
- * Supports: "first", "second", "third", "last", "previous", "last two", "last three", "all"
- */
-function pickImagesByNaturalLanguage({ question, images, currentImageId }) {
-  const q = (question || "").toLowerCase();
-
-  if (!images || images.length === 0) return [];
-
-  const current = currentImageId ? images.find((x) => x.imageId === currentImageId) : null;
-
-  // indexes
-  const first = images[0];
-  const second = images[1];
-  const third = images[2];
-  const last = images[images.length - 1];
-  const prev = images.length >= 2 ? images[images.length - 2] : null;
-
-  const wantsAll = q.includes("all images") || q.includes("compare all") || q.includes("compare everything");
-  const wantsLastTwo = q.includes("last two") || q.includes("last 2");
-  const wantsLastThree = q.includes("last three") || q.includes("last 3");
-
-  // explicit ordinal refs
-  const mentionsFirst = q.includes("first image") || q.includes("1st image") || q.includes("first photo") || q.includes("1st photo");
-  const mentionsSecond = q.includes("second image") || q.includes("2nd image") || q.includes("second photo") || q.includes("2nd photo");
-  const mentionsThird = q.includes("third image") || q.includes("3rd image") || q.includes("third photo") || q.includes("3rd photo");
-
-  const mentionsLast = q.includes("last image") || q.includes("last photo");
-  const mentionsPrev = q.includes("previous image") || q.includes("previous photo") || q.includes("prev image") || q.includes("prev photo");
-
-  // Start with chosen set
-  let chosen = [];
-
-  if (wantsAll) {
-    // Don't attach every full image (can explode size). We'll attach up to 3 newest,
-    // but include captions for all.
-    chosen = images.slice(-3);
-    return { chosen, useAllCaptions: true };
-  }
-
-  if (wantsLastThree) {
-    chosen = images.slice(-3);
-    return { chosen, useAllCaptions: false };
-  }
-
-  if (wantsLastTwo) {
-    chosen = images.slice(-2);
-    return { chosen, useAllCaptions: false };
-  }
-
-  // If user references specific images, include them
-  if (mentionsFirst && first) chosen.push(first);
-  if (mentionsSecond && second) chosen.push(second);
-  if (mentionsThird && third) chosen.push(third);
-  if (mentionsLast && last) chosen.push(last);
-  if (mentionsPrev && prev) chosen.push(prev);
-
-  // If user says “this image”, include current if available
-  const mentionsThis = q.includes("this image") || q.includes("this photo") || q.includes("this one");
-  if (mentionsThis && current) chosen.push(current);
-
-  // If user asked to compare and didn't specify, default to last 2 (or last 1 if only one)
-  const wantsCompare =
-    q.includes("compare") ||
-    q.includes("difference") ||
-    q.includes("different") ||
-    q.includes("similar") ||
-    q.includes("same") ||
-    q.includes("related") ||
-    q.includes("relation");
-
-  if (chosen.length === 0) {
-    chosen = wantsCompare ? images.slice(-2) : images.slice(-1);
-  }
-
-  // Dedup
-  const map = new Map();
-  for (const img of chosen) map.set(img.imageId, img);
-
-  // cap attached images to 3 to keep payload safe
-  const capped = Array.from(map.values()).slice(-3);
-
-  return { chosen: capped, useAllCaptions: false };
-}
-
-/**
- * POST /ask
- * JSON:
- * { sessionId, question, currentImageId? }
- */
-app.post("/ask", async (req, res) => {
+// POST /ask — Follow-up questions with translation
+app.post('/ask', async (req, res) => {
   try {
-    const { sessionId = "default", question, currentImageId } = req.body || {};
-    if (!question || typeof question !== "string") {
-      return res.status(400).json({ error: "Missing question" });
-    }
-
-    const session = getSession(sessionId);
-    const allImages = session.images;
-
-    if (!allImages || allImages.length === 0) {
-      return res.json({
-        sessionId,
-        answer: "No images uploaded yet. Please take a photo first.",
-        usedImageIds: [],
-        imageCount: 0,
-      });
-    }
-
-    const { chosen, useAllCaptions } = pickImagesByNaturalLanguage({
+    const {
+      sessionId = 'default',
       question,
-      images: allImages,
       currentImageId,
+      inputLanguage = 'en',
+      inputLanguageName = 'English',
+      outputLanguage = 'en',
+      outputLanguageName = 'English'
+    } = req.body;
+
+    if (!question) return res.status(400).json({ error: 'No question provided' });
+
+    const session = getSession(sessionId);
+
+    let targetImage = null;
+    if (currentImageId) targetImage = session.images.find(img => img.id === currentImageId);
+    if (!targetImage && session.images.length > 0) targetImage = session.images[session.images.length - 1];
+
+    let systemPrompt;
+    if (outputLanguage === 'en') {
+      systemPrompt = `You are a visual assistant for a visually impaired person.
+Answer questions about what you see in images. Be specific and helpful.
+If you can identify anything in the image (landmark, product, brand, text, species, etc.), name it.
+If the user asks to read text, read ALL visible text completely.
+If the user asks to translate, translate any foreign text to English.
+If the user asks "where am I", identify the location based on visual clues.
+If the user's question is in another language, understand it but respond in English.
+Be concise and helpful (1-3 sentences).`;
+    } else {
+      systemPrompt = `You are a visual assistant for a visually impaired person.
+Answer questions about what you see in images. Be specific and helpful.
+If you can identify anything in the image (landmark, product, brand, text, species, etc.), name it.
+If the user asks to read text, read ALL visible text completely.
+If the user asks to translate, translate any foreign text to ${outputLanguageName}.
+If the user asks "where am I", identify the location based on visual clues.
+The user may speak in ${inputLanguageName}. Understand their question regardless of language.
+IMPORTANT: Always respond ENTIRELY in ${outputLanguageName} (${outputLanguage}).
+Be concise and helpful (1-3 sentences).`;
+    }
+
+    const messages = [{ role: 'system', content: systemPrompt }];
+
+    // Include conversation history for context (last 4 exchanges)
+    const recentHistory = session.history.slice(-8);
+    for (const entry of recentHistory) {
+      if (entry.role === 'user') {
+        messages.push({ role: 'user', content: entry.content });
+      } else if (entry.role === 'assistant') {
+        messages.push({ role: 'assistant', content: entry.content });
+      }
+    }
+
+    if (targetImage) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:${targetImage.mimeType};base64,${targetImage.base64}`, detail: 'low' } },
+          { type: 'text', text: question }
+        ]
+      });
+    } else {
+      messages.push({ role: 'user', content: question });
+    }
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages,
+      max_tokens: 600
     });
 
-    const captionsContext = (useAllCaptions ? allImages : chosen).map((img, idx) => {
-      return `Image ${idx + 1} caption: ${img.caption}`;
-    });
+    const answer = response.choices[0]?.message?.content || 'I could not answer that.';
+    session.history.push({ role: 'user', content: question });
+    session.history.push({ role: 'assistant', content: answer });
 
-    const chatContext = session.chat.slice(-30);
+    // Keep history manageable
+    if (session.history.length > 20) session.history = session.history.slice(-20);
 
-    const r = await client.responses.create({
-      model: "gpt-5",
-      input: [
-        {
-          role: "system",
-          content: [
-            {
-              type: "input_text",
-              text:
-                "You are a visual assistant for a visually impaired person. " +
-                "Respond naturally like a helpful guide. No headings/lists. " +
-                "If asked to compare, clearly explain similarities and differences. " +
-                "If asked who made/painted something, do not claim certainty—describe what style it resembles instead.",
-            },
-          ],
-        },
-        ...chatContext.map((m) => ({
-          role: m.role,
-          content: [{ type: "input_text", text: m.text }],
-        })),
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: `User question: ${question}` },
-            { type: "input_text", text: `Known captions:\n${captionsContext.join("\n")}` },
-            // Attach only selected images (max 3)
-            ...chosen.map((img) => ({ type: "input_image", image_url: img.dataUrl })),
-          ],
-        },
-      ],
-    });
-
-    const answer = (r.output_text || "").trim();
-    if (!answer) return res.status(500).json({ error: "Empty response from model" });
-
-    session.chat.push({ role: "user", text: question, createdAt: Date.now() });
-    session.chat.push({ role: "assistant", text: answer, createdAt: Date.now() });
-
-    res.json({
-      sessionId,
-      answer,
-      usedImageIds: chosen.map((x) => x.imageId),
-      imageCount: allImages.length,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Failed to answer" });
+    res.json({ answer });
+  } catch (err) {
+    console.error('Error answering question:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/sessions/:sessionId/images", (req, res) => {
-  const session = getSession(req.params.sessionId);
+// GET /health — Health check
+app.get('/health', (req, res) => {
   res.json({
-    sessionId: req.params.sessionId,
-    images: session.images.map((x, i) => ({
-      index: i + 1,
-      imageId: x.imageId,
-      createdAt: x.createdAt,
-      caption: x.caption,
-    })),
-    chatTurns: session.chat.length,
+    status: 'ok',
+    sessions: Object.keys(sessions).length,
+    features: ['image-recognition', 'multilingual', 'translation', 'conversation-history']
   });
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Backend running on port ${port}`);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n=== GlassDescribe Server ===`);
+  console.log(`Running on port ${PORT}`);
+  console.log(`\nEndpoints:`);
+  console.log(`  POST /images  — Upload & describe (identifies landmarks, products, text, etc.)`);
+  console.log(`  POST /ask     — Follow-up questions (with translation & conversation history)`);
+  console.log(`  GET  /health  — Health check`);
+  console.log(`\nSupported features:`);
+  console.log(`  - Recognizes buildings, landmarks, art, brands, products, animals, food, etc.`);
+  console.log(`  - 15 languages with voice input and spoken output`);
+  console.log(`  - Translates foreign text in images`);
+  console.log(`  - Reads all visible text aloud`);
+  console.log(`  - Hazard and obstacle detection`);
+  console.log(`  - Conversation history for follow-up questions\n`);
 });
